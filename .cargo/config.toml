@@ -1,0 +1,15 @@
+# Cargo configuration for Peacock
+
+# Run with sudo by default
+[target.x86_64-unknown-linux-gnu]
+runner = "sudo -E"
+rustflags = ["-C", "target-cpu=native"]
+
+[build]
+# Optimization for release builds
+jobs = 4
+
+[alias]
+# Useful aliases
+sbuild = "build --release"
+check-all = "clippy --all-targets"
