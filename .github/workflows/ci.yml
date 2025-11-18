@@ -57,8 +57,8 @@ jobs:
 
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
-  build:
-    name: Build Check
+  test:
+    name: Build and Test
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -73,11 +73,11 @@ jobs:
           shared-key: "ci-cache"
           cache-on-failure: true
 
-      - name: Check build
-        run: cargo check --all-targets --all-features --verbose
-
-      - name: Build debug
+      - name: Build
         run: cargo build --verbose
+
+      - name: Test
+        run: cargo test --verbose
 
       - name: Build release
         run: cargo build --release --verbose
