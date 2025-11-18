@@ -1,0 +1,33 @@
+# Build artifacts
+target/
+**/*.rs.bk
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Documentation
+*.md
+!README.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# CI/CD
+.factory/
+
+# Cargo lock on binary projects (optional)
+# Cargo.lock
+
+# Test files
+tests/
+
+# Temporary files
+*.tmp
+*.log
+.cache/
