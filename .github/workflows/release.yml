@@ -28,7 +28,7 @@ jobs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}
       release_id: ${{ steps.create_release.outputs.id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
 
@@ -60,7 +60,7 @@ jobs:
             asset_name: uncflow-x86_64-linux-musl
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
 
