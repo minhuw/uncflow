@@ -1,3 +1,3 @@
 # uncflow
 
-**Uncore Flow Analyzer** understanding traffics on intra-host network with Hardware Performance Counters.
+**Uncore Flow Analyzer** - Understanding traffic on intra-host networks with Hardware Performance Counters.
