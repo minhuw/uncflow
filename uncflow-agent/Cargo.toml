@@ -13,7 +13,7 @@ path = "lib.rs"
 
 [dependencies]
 # Hardware Access
-nix = { version = "0.27", features = ["sched", "fs", "mman"] }
+nix = { version = "0.30", features = ["sched", "fs", "mman"] }
 
 # Metrics & Monitoring
 prometheus = { version = "0.13", features = ["process"] }
