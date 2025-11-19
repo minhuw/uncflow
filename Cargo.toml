@@ -1,14 +1,16 @@
 [workspace]
+resolver = "2"
 members = [
     "uncflow-agent",
+    "uncflow-raw",
 ]
-resolver = "2"
 
 [workspace.package]
 version = "2.0.0"
 edition = "2021"
+authors = ["Minhu Wang <minhuw@acm.org"]
+license = "MIT"
+repository = "https://github.com/minhuw/uncflow"
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+[workspace.dependencies]
+thiserror = "2.0.17"

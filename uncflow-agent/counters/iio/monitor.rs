@@ -1,4 +1,6 @@
 // IIO (Integrated IO) Monitor
+//
+// Now uses uncflow-raw for type-safe hardware register programming
 
 use crate::common::msr;
 use crate::error::Result;
@@ -6,40 +8,12 @@ use crate::metrics::iio::IioMetric;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-// Skylake IIO MSR addresses (3 IIO units per socket)
-const IIO_CHANNEL: usize = 3;
-const IIO_PCIE_PORT_NUM: usize = 4;
-const _IIO_COUNTERS: usize = 4;
-const IIO_COUNTER_WIDTH: u64 = 36;
-const UNCORE_COUNTER_WIDTH: u64 = 48;
+// Import hardware definitions from uncflow-raw
+use uncflow_raw::current_arch::iio::{self, IioCounterControl};
+use uncflow_raw::RegisterLayout;
+
+// Business logic constants
 const CACHELINE_SIZE: u64 = 64;
-
-const IIO_UNIT_BOX_CTL: [u64; 3] = [0x0A60, 0x0A80, 0x0AA0];
-const _IIO_UNIT_BOX_STATUS: [u64; 3] = [0x0A67, 0x0A87, 0x0AA7];
-
-const IIO_UNIT_CTL0: [u64; 3] = [0x0A68, 0x0A88, 0x0AA8];
-const IIO_UNIT_CTL1: [u64; 3] = [0x0A69, 0x0A89, 0x0AA9];
-const IIO_UNIT_CTL2: [u64; 3] = [0x0A6A, 0x0A8A, 0x0AAA];
-const IIO_UNIT_CTL3: [u64; 3] = [0x0A6B, 0x0A8B, 0x0AAB];
-
-const IIO_UNIT_CTR0: [u64; 3] = [0x0A61, 0x0A81, 0x0AA1];
-const IIO_UNIT_CTR1: [u64; 3] = [0x0A62, 0x0A82, 0x0AA2];
-const IIO_UNIT_CTR2: [u64; 3] = [0x0A63, 0x0A83, 0x0AA3];
-const IIO_UNIT_CTR3: [u64; 3] = [0x0A64, 0x0A84, 0x0AA4];
-const IIO_UNIT_CLK: [u64; 3] = [0x0A65, 0x0A85, 0x0AA5];
-
-// PCIe free-running bandwidth counters
-const IIO_PCIE_BANDWIDTH_IN: [[u64; 4]; 3] = [
-    [0x0B10, 0x0B11, 0x0B12, 0x0B13],
-    [0x0B20, 0x0B21, 0x0B22, 0x0B23],
-    [0x0B30, 0x0B31, 0x0B32, 0x0B33],
-];
-
-const IIO_PCIE_BANDWIDTH_OUT: [[u64; 4]; 3] = [
-    [0x0B14, 0x0B15, 0x0B16, 0x0B17],
-    [0x0B24, 0x0B25, 0x0B26, 0x0B27],
-    [0x0B34, 0x0B35, 0x0B36, 0x0B37],
-];
 
 // IIO Event configurations
 #[derive(Debug, Clone)]
@@ -90,35 +64,57 @@ impl IioCounterUnit {
     }
 
     fn freeze_and_reset(&self) -> Result<()> {
-        let ctrl_addr = IIO_UNIT_BOX_CTL[self.index];
+        let ctrl_addr = iio::msr::IIO_UNIT_BOX_CTL[self.index];
         msr::write(self.core, ctrl_addr, 0x100)?; // Freeze
         msr::write(self.core, ctrl_addr, 0x102)?; // Reset
         Ok(())
     }
 
     fn unfreeze(&self) -> Result<()> {
-        let ctrl_addr = IIO_UNIT_BOX_CTL[self.index];
+        let ctrl_addr = iio::msr::IIO_UNIT_BOX_CTL[self.index];
         msr::write(self.core, ctrl_addr, 0)?;
         Ok(())
     }
 
     fn program(&self, config: &IioEventConfig) -> Result<()> {
-        self.freeze_and_reset()?;
+        // Try to freeze and reset, but don't fail if it doesn't work
+        // Some systems may have read-only IIO MSRs
+        if let Err(e) = self.freeze_and_reset() {
+            tracing::debug!(
+                "IIO freeze/reset not supported on this system (unit {}): {}",
+                self.index,
+                e
+            );
+            return Err(e);
+        }
 
         let ctrl_addrs = [
-            IIO_UNIT_CTL0[self.index],
-            IIO_UNIT_CTL1[self.index],
-            IIO_UNIT_CTL2[self.index],
-            IIO_UNIT_CTL3[self.index],
+            iio::msr::IIO_UNIT_CTL0[self.index],
+            iio::msr::IIO_UNIT_CTL1[self.index],
+            iio::msr::IIO_UNIT_CTL2[self.index],
+            iio::msr::IIO_UNIT_CTL3[self.index],
         ];
 
         for (i, &(event, umask, ch_mask, fc_mask)) in config.events.iter().enumerate() {
-            let ctrl_value = (event as u64)
-                | ((umask as u64) << 8)
-                | ((ch_mask as u64) << 36)
-                | ((fc_mask as u64) << 48)
-                | (1 << 22); // Enable
-            msr::write(self.core, ctrl_addrs[i], ctrl_value)?;
+            // Use type-safe register struct from uncflow-raw
+            let ctrl = IioCounterControl {
+                event_select: event,
+                unit_mask: umask,
+                reset_counter: true,
+                overflow_enable: true,
+                enable: true,
+                channel_mask: ch_mask,
+                fc_mask,
+                ..Default::default()
+            };
+
+            // Validate before writing (type safety!)
+            ctrl.validate()
+                .map_err(|e| crate::error::UncflowError::HardwareError(e.to_string()))?;
+
+            // Convert to MSR value and write
+            // If write fails, propagate error
+            msr::write(self.core, ctrl_addrs[i], ctrl.to_msr_value())?;
         }
 
         self.unfreeze()?;
@@ -127,15 +123,15 @@ impl IioCounterUnit {
 
     fn read_counters(&self) -> Result<[u64; 5]> {
         let ctr_addrs = [
-            IIO_UNIT_CTR0[self.index],
-            IIO_UNIT_CTR1[self.index],
-            IIO_UNIT_CTR2[self.index],
-            IIO_UNIT_CTR3[self.index],
-            IIO_UNIT_CLK[self.index],
+            iio::msr::IIO_UNIT_CTR0[self.index],
+            iio::msr::IIO_UNIT_CTR1[self.index],
+            iio::msr::IIO_UNIT_CTR2[self.index],
+            iio::msr::IIO_UNIT_CTR3[self.index],
+            iio::msr::IIO_UNIT_CLK[self.index],
         ];
 
         let mut values = [0u64; 5];
-        let mask = (1u64 << UNCORE_COUNTER_WIDTH) - 1;
+        let mask = (1u64 << iio::UNCORE_COUNTER_WIDTH_BITS) - 1;
         for (i, &addr) in ctr_addrs.iter().enumerate() {
             values[i] = msr::read(self.core, addr)? & mask;
         }
@@ -150,8 +146,9 @@ pub struct IioMonitor {
     core: u32,
     units: Vec<IioCounterUnit>,
     event_results: HashMap<String, Vec<[u64; 5]>>,
-    pcie_last_values: Option<[[u64; IIO_PCIE_PORT_NUM * 2]; IIO_CHANNEL]>,
+    pcie_last_values: Option<[[u64; iio::IIO_PCIE_PORT_COUNT * 2]; iio::IIO_CHANNEL_COUNT]>,
     pcie_last_time: Option<Instant>,
+    programmable_warned: bool, // Track if we've already warned about programmable counters
 }
 
 impl IioMonitor {
@@ -159,7 +156,7 @@ impl IioMonitor {
         let core = (socket as u32) * 16;
 
         let mut units = Vec::new();
-        for i in 0..IIO_CHANNEL {
+        for i in 0..iio::IIO_CHANNEL_COUNT {
             units.push(IioCounterUnit::new(core, i)?);
         }
 
@@ -170,23 +167,63 @@ impl IioMonitor {
             event_results: HashMap::new(),
             pcie_last_values: None,
             pcie_last_time: None,
+            programmable_warned: false,
         })
     }
 
     pub fn collect_metrics(&mut self) -> Result<HashMap<IioMetric, f64>> {
         let mut metrics = HashMap::new();
 
-        // Collect programmable counter metrics
+        // Try to collect programmable counter metrics
+        // If this fails (MSR writes not supported), we'll only collect PCIe bandwidth
+        let programmable_supported = self.try_collect_programmable_metrics(&mut metrics);
+
+        if !programmable_supported && !self.programmable_warned {
+            tracing::warn!(
+                "IIO programmable counters not available on socket {} (MSR writes protected). \
+                 Only PCIe bandwidth metrics will be reported.",
+                self.socket
+            );
+            self.programmable_warned = true; // Only warn once
+        }
+
+        // Collect PCIe free-running counter metrics (these are always read-only)
+        self.collect_pcie_bandwidth(&mut metrics)?;
+
+        Ok(metrics)
+    }
+
+    fn try_collect_programmable_metrics(&mut self, metrics: &mut HashMap<IioMetric, f64>) -> bool {
+        // Try to collect programmable counter metrics
         for event_config in IIO_EVENTS {
+            // Try to program all units for this event
+            let mut program_failed = false;
             for unit in &self.units {
-                unit.program(event_config)?;
+                if let Err(e) = unit.program(event_config) {
+                    tracing::debug!("Failed to program IIO unit: {}", e);
+                    program_failed = true;
+                    break;
+                }
             }
 
+            if program_failed {
+                // MSR writes not supported - return false
+                return false;
+            }
+
+            // Sleep to collect data
             std::thread::sleep(Duration::from_secs(1));
 
+            // Read counters
             let mut all_values = Vec::new();
             for unit in &self.units {
-                all_values.push(unit.read_counters()?);
+                match unit.read_counters() {
+                    Ok(values) => all_values.push(values),
+                    Err(e) => {
+                        tracing::debug!("Failed to read IIO counters: {}", e);
+                        return false;
+                    }
+                }
             }
 
             self.event_results
@@ -194,12 +231,12 @@ impl IioMonitor {
         }
 
         // Calculate metrics from programmable counters
-        self.calculate_programmable_metrics(&mut metrics)?;
+        if let Err(e) = self.calculate_programmable_metrics(metrics) {
+            tracing::debug!("Failed to calculate programmable metrics: {}", e);
+            return false;
+        }
 
-        // Collect PCIe free-running counter metrics
-        self.collect_pcie_bandwidth(&mut metrics)?;
-
-        Ok(metrics)
+        true
     }
 
     fn calculate_programmable_metrics(&self, metrics: &mut HashMap<IioMetric, f64>) -> Result<()> {
@@ -247,19 +284,22 @@ impl IioMonitor {
     }
 
     fn collect_pcie_bandwidth(&mut self, metrics: &mut HashMap<IioMetric, f64>) -> Result<()> {
-        let mut current_values = [[0u64; IIO_PCIE_PORT_NUM * 2]; IIO_CHANNEL];
+        let mut current_values = [[0u64; iio::IIO_PCIE_PORT_COUNT * 2]; iio::IIO_CHANNEL_COUNT];
 
         // Read all PCIe counters
-        for ch in 0..IIO_CHANNEL {
-            for port in 0..IIO_PCIE_PORT_NUM {
-                let in_addr = IIO_PCIE_BANDWIDTH_IN[ch][port];
-                let out_addr = IIO_PCIE_BANDWIDTH_OUT[ch][port];
+        #[allow(clippy::needless_range_loop)]
+        for ch in 0..iio::IIO_CHANNEL_COUNT {
+            for port in 0..iio::IIO_PCIE_PORT_COUNT {
+                let in_addr = iio::msr::IIO_PCIE_BANDWIDTH_IN[ch][port];
+                let out_addr = iio::msr::IIO_PCIE_BANDWIDTH_OUT[ch][port];
 
-                let in_val = msr::read(self.core, in_addr)? & ((1u64 << IIO_COUNTER_WIDTH) - 1);
-                let out_val = msr::read(self.core, out_addr)? & ((1u64 << IIO_COUNTER_WIDTH) - 1);
+                let in_val =
+                    msr::read(self.core, in_addr)? & ((1u64 << iio::IIO_COUNTER_WIDTH_BITS) - 1);
+                let out_val =
+                    msr::read(self.core, out_addr)? & ((1u64 << iio::IIO_COUNTER_WIDTH_BITS) - 1);
 
                 current_values[ch][port] = in_val;
-                current_values[ch][port + IIO_PCIE_PORT_NUM] = out_val;
+                current_values[ch][port + iio::IIO_PCIE_PORT_COUNT] = out_val;
             }
         }
 
@@ -270,24 +310,24 @@ impl IioMonitor {
         {
             let elapsed = current_time.duration_since(last_time).as_secs_f64();
 
-            for ch in 0..IIO_CHANNEL {
-                for port in 0..IIO_PCIE_PORT_NUM {
+            for ch in 0..iio::IIO_CHANNEL_COUNT {
+                for port in 0..iio::IIO_PCIE_PORT_COUNT {
                     // IN bandwidth
                     let in_delta = if current_values[ch][port] >= last_values[ch][port] {
                         current_values[ch][port] - last_values[ch][port]
                     } else {
-                        (1u64 << IIO_COUNTER_WIDTH) - last_values[ch][port]
+                        (1u64 << iio::IIO_COUNTER_WIDTH_BITS) - last_values[ch][port]
                             + current_values[ch][port]
                     };
                     let in_bandwidth = (in_delta as f64 * CACHELINE_SIZE as f64) / elapsed / 1e9;
                     metrics.insert(IioMetric::PCIeInBandwidth(ch, port), in_bandwidth);
 
                     // OUT bandwidth
-                    let out_idx = port + IIO_PCIE_PORT_NUM;
+                    let out_idx = port + iio::IIO_PCIE_PORT_COUNT;
                     let out_delta = if current_values[ch][out_idx] >= last_values[ch][out_idx] {
                         current_values[ch][out_idx] - last_values[ch][out_idx]
                     } else {
-                        (1u64 << IIO_COUNTER_WIDTH) - last_values[ch][out_idx]
+                        (1u64 << iio::IIO_COUNTER_WIDTH_BITS) - last_values[ch][out_idx]
                             + current_values[ch][out_idx]
                     };
                     let out_bandwidth = (out_delta as f64 * CACHELINE_SIZE as f64) / elapsed / 1e9;

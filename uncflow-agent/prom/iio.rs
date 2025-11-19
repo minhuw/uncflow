@@ -4,6 +4,7 @@ use crate::counters::iio::IioMonitor;
 use crate::error::Result;
 use crate::metrics::iio::IioMetric;
 use crate::ExportConfig;
+use parking_lot::Mutex;
 use prometheus::{Gauge, Registry};
 use std::collections::HashMap;
 
@@ -11,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 pub struct IioMetricExporter {
-    monitors: Vec<IioMonitor>,
+    monitors: Mutex<Vec<IioMonitor>>, // Use Mutex for interior mutability
     registry: Registry,
     gauges: HashMap<(i32, String), Gauge>,
 }
@@ -40,14 +41,17 @@ impl IioMetricExporter {
         }
 
         Ok(Self {
-            monitors,
+            monitors: Mutex::new(monitors),
             registry,
             gauges,
         })
     }
 
     pub fn start(&self) {
-        let monitors = self.monitors.iter().map(|m| m.socket()).collect::<Vec<_>>();
+        let monitors = {
+            let lock = self.monitors.lock();
+            lock.iter().map(|m| m.socket()).collect::<Vec<_>>()
+        };
         let gauges = self.gauges.clone();
 
         thread::spawn(move || loop {
@@ -78,26 +82,20 @@ impl IioMetricExporter {
 
     /// Collect metrics once (called by orchestrator)
     pub async fn collect(&self) {
-        let sockets: Vec<_> = self.monitors.iter().map(|m| m.socket()).collect();
-
-        for &socket in &sockets {
-            if let Ok(mut monitor) = IioMonitor::new(socket) {
-                match monitor.collect_metrics() {
-                    Ok(metrics) => {
-                        for (metric, value) in metrics {
-                            let metric_name = metric.name();
-                            if let Some(gauge) = self.gauges.get(&(socket, metric_name)) {
-                                gauge.set(value);
-                            }
+        let mut monitors = self.monitors.lock();
+        for monitor in monitors.iter_mut() {
+            let socket = monitor.socket();
+            match monitor.collect_metrics() {
+                Ok(metrics) => {
+                    for (metric, value) in metrics {
+                        let metric_name = metric.name();
+                        if let Some(gauge) = self.gauges.get(&(socket, metric_name)) {
+                            gauge.set(value);
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to collect IIO metrics for socket {}: {}",
-                            socket,
-                            e
-                        );
-                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to collect IIO metrics for socket {}: {}", socket, e);
                 }
             }
         }
