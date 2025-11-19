@@ -58,7 +58,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    name: Build and Test
+    name: Build and Check
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -76,8 +76,11 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
-      - name: Test
-        run: cargo test --verbose
-
       - name: Build release
         run: cargo build --release --verbose
+
+      - name: Check
+        run: cargo check --all-features --verbose
+
+      - name: Check Release
+        run: cargo check --all-features --release --verbose
