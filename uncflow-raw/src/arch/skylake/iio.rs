@@ -127,32 +127,32 @@ pub struct IioCounterControl {
     /// Unit mask / event sub-select (bits 8-15)
     pub unit_mask: u8,
 
-    /// Reset counter on programming (bit 16)
+    /// Reset counter on programming (bit 17)
     pub reset_counter: bool,
 
-    /// Edge detection mode (bit 17)
+    /// Edge detection mode (bit 18)
     pub edge_detect: bool,
 
-    /// Thread ID filtering enable (bit 18)
+    /// Thread ID filtering enable (bit 19)
     pub thread_id_enable: bool,
 
-    /// Overflow interrupt enable (bit 19)
+    /// Overflow interrupt enable (bit 20)
     pub overflow_enable: bool,
 
-    /// Enable counter (bit 21)
+    /// Enable counter (bit 22)
     pub enable: bool,
 
-    /// Invert threshold comparison (bit 22)
+    /// Invert threshold comparison (bit 23)
     pub invert: bool,
 
-    /// Threshold value for occupancy filtering (bits 23-34, 12 bits)
+    /// Threshold value for occupancy filtering (bits 24-35, 12 bits)
     pub threshold: u16,
 
-    /// Channel mask - which IIO channels to monitor (bits 35-42, 8 bits)
+    /// Channel mask - which IIO channels to monitor (bits 36-43, 8 bits)
     /// Set bit N to monitor channel N. 0xFF = all channels.
     pub channel_mask: u8,
 
-    /// Fabric configuration mask (bits 43-45, 3 bits)
+    /// Fabric configuration mask (bits 44-46, 3 bits)
     /// Filters by fabric request type. 0x07 = all types.
     pub fc_mask: u8,
 }

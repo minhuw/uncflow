@@ -8,7 +8,7 @@ members = [
 [workspace.package]
 version = "2.0.0"
 edition = "2021"
-authors = ["Minhu Wang <minhuw@acm.org"]
+authors = ["Minhu Wang <minhuw@acm.org>"]
 license = "MIT"
 repository = "https://github.com/minhuw/uncflow"
 
