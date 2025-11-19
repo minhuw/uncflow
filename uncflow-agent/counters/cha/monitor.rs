@@ -1,5 +1,7 @@
 // CHA (Cache Home Agent) monitoring with comprehensive event collection
 // Supports event rotation for full transaction coverage
+//
+// Now uses uncflow-raw for type-safe hardware register programming
 
 use crate::common::{arch::CPU_ARCH, msr};
 use crate::counters::cha::ChaEventConfig;
@@ -8,15 +10,11 @@ use crate::metrics::cha::RawEventData;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-// CHA MSR base addresses
-const CHA_MSR_PMON_BOX_CTL: u64 = 0x0E00;
-const CHA_MSR_PMON_CTL0: u64 = 0x0E01;
-const CHA_MSR_PMON_CTR0: u64 = 0x0E08;
-const CHA_MSR_PMON_BOX_FILTER0: u64 = 0x0E05;
-const CHA_MSR_PMON_BOX_FILTER1: u64 = 0x0E06;
-
-// CHA box stride (offset between CHA boxes)
-const CHA_BOX_STRIDE: u64 = 0x10;
+// Import hardware definitions from uncflow-raw
+use uncflow_raw::current_arch::cha::{
+    self, ChaBoxControl, ChaCounterControl, ChaFilter0, ChaFilter1,
+};
+use uncflow_raw::RegisterLayout;
 
 /// Event group for rotation scheduling
 #[derive(Debug, Clone)]
@@ -162,50 +160,96 @@ impl ChaMonitor {
     }
 
     fn program_event_group(&self, cha_id: usize, group: &EventGroup) -> Result<()> {
-        let base_addr = CHA_MSR_PMON_BOX_CTL + (cha_id as u64 * CHA_BOX_STRIDE);
-        let ctl_addr = base_addr;
+        let box_ctl_addr = cha::msr::box_ctl(cha_id);
 
-        // Freeze the CHA box
-        msr::Msr::instance().write(self.representative_core, ctl_addr, 0x00)?;
+        // Freeze the CHA box using type-safe struct
+        let freeze_ctrl = ChaBoxControl {
+            freeze: true,
+            freeze_enable: true,
+            ..Default::default()
+        };
+        msr::Msr::instance().write(
+            self.representative_core,
+            box_ctl_addr,
+            freeze_ctrl.to_msr_value(),
+        )?;
 
-        // Setup filters if needed (for transaction opcodes)
+        // Setup filter 0 if needed (for transaction opcodes)
         if group.config.opc0 != 0 {
-            let filter0_addr = base_addr + (CHA_MSR_PMON_BOX_FILTER0 - CHA_MSR_PMON_BOX_CTL);
-            let filter_value = group.config.opc0 as u64;
-            msr::Msr::instance().write(self.representative_core, filter0_addr, filter_value)?;
+            let filter0 = ChaFilter0 {
+                opcode_match: group.config.opc0 as u16,
+            };
+            let filter0_addr = cha::msr::filter0(cha_id);
+            msr::Msr::instance().write(
+                self.representative_core,
+                filter0_addr,
+                filter0.to_msr_value(),
+            )?;
         }
 
+        // Setup filter 1 if needed (for cache line states)
         if group.config.state != 0 {
-            let filter1_addr = base_addr + (CHA_MSR_PMON_BOX_FILTER1 - CHA_MSR_PMON_BOX_CTL);
-            let filter_value = (group.config.state as u64) << 17; // State field at bits 17-23
-            msr::Msr::instance().write(self.representative_core, filter1_addr, filter_value)?;
+            let filter1 = ChaFilter1 {
+                tid: 0,
+                state: group.config.state as u8,
+            };
+            let filter1_addr = cha::msr::filter1(cha_id);
+            msr::Msr::instance().write(
+                self.representative_core,
+                filter1_addr,
+                filter1.to_msr_value(),
+            )?;
         }
 
-        // Program all 4 counters
-        let ctl0_addr = base_addr + (CHA_MSR_PMON_CTL0 - CHA_MSR_PMON_BOX_CTL);
+        // Program all 4 counters using type-safe structs
         for i in 0..4 {
             let (event, umask) = group.counter_configs[i];
             if event != 0 || umask != 0 {
-                let ctl_addr = ctl0_addr + i as u64;
-                let event_select = (event as u64) | ((umask as u64) << 8) | (1 << 22); // Enable bit
-                msr::Msr::instance().write(self.representative_core, ctl_addr, event_select)?;
+                let ctrl = ChaCounterControl {
+                    event_select: event,
+                    unit_mask: umask,
+                    enable: true,
+                    ..Default::default()
+                };
+
+                // Validate before writing (type safety!)
+                ctrl.validate()
+                    .map_err(|e| crate::error::UncflowError::HardwareError(e.to_string()))?;
+
+                let ctl_addr = cha::msr::counter_ctl(cha_id, i);
+                msr::Msr::instance().write(
+                    self.representative_core,
+                    ctl_addr,
+                    ctrl.to_msr_value(),
+                )?;
             }
         }
 
         // Unfreeze the CHA box
-        msr::Msr::instance().write(self.representative_core, ctl_addr, 0x10000)?;
+        let unfreeze_ctrl = ChaBoxControl {
+            freeze: false,
+            freeze_enable: true,
+            ..Default::default()
+        };
+        msr::Msr::instance().write(
+            self.representative_core,
+            box_ctl_addr,
+            unfreeze_ctrl.to_msr_value(),
+        )?;
 
         Ok(())
     }
 
     fn read_cha_counters(&self, cha_id: usize) -> Result<ChaRawCounters> {
-        let base_addr = CHA_MSR_PMON_CTR0 + (cha_id as u64 * CHA_BOX_STRIDE);
-
         Ok(ChaRawCounters {
-            counter0: msr::Msr::instance().read(self.representative_core, base_addr)?,
-            counter1: msr::Msr::instance().read(self.representative_core, base_addr + 1)?,
-            counter2: msr::Msr::instance().read(self.representative_core, base_addr + 2)?,
-            counter3: msr::Msr::instance().read(self.representative_core, base_addr + 3)?,
+            counter0: msr::Msr::instance()
+                .read(self.representative_core, cha::msr::counter_value(cha_id, 0))?,
+            counter1: msr::Msr::instance()
+                .read(self.representative_core, cha::msr::counter_value(cha_id, 1))?,
+            counter2: msr::Msr::instance()
+                .read(self.representative_core, cha::msr::counter_value(cha_id, 2))?,
+            counter3: msr::Msr::instance()
+                .read(self.representative_core, cha::msr::counter_value(cha_id, 3))?,
         })
     }
 

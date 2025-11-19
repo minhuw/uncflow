@@ -4,6 +4,7 @@ use prometheus::{Encoder, TextEncoder};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::signal;
+use tokio_util::sync::CancellationToken;
 
 use uncflow::{
     ChaMetricExporter, CollectorConfig, CoreMetricExporter, ExportConfig, IioMetricExporter,
@@ -72,6 +73,7 @@ struct AppState {
     cha_exporter: Option<Arc<ChaMetricExporter>>,
     irp_exporter: Option<Arc<IrpMetricExporter>>,
     iio_exporter: Option<Arc<IioMetricExporter>>,
+    collection_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 async fn metrics_handler(
@@ -168,50 +170,72 @@ fn parse_range_list(inputs: &[String]) -> Vec<i32> {
 fn init_orchestrator_mode(
     config: ExportConfig,
     collector_config: CollectorConfig,
+    cancel_token: CancellationToken,
 ) -> Result<AppState> {
     let collector = MetricCollector::new(config, collector_config)?;
 
     // Extract exporters for metrics handler BEFORE starting (which consumes self)
-    let state = AppState {
-        rapl_exporter: collector.rapl_exporter(),
-        rdt_exporter: collector.rdt_exporter(),
-        core_exporter: collector.core_exporter(),
-        imc_exporter: collector.imc_exporter(),
-        cha_exporter: collector.cha_exporter(),
-        irp_exporter: collector.irp_exporter(),
-        iio_exporter: collector.iio_exporter(),
-    };
+    let rapl_exporter = collector.rapl_exporter();
+    let rdt_exporter = collector.rdt_exporter();
+    let core_exporter = collector.core_exporter();
+    let imc_exporter = collector.imc_exporter();
+    let cha_exporter = collector.cha_exporter();
+    let irp_exporter = collector.irp_exporter();
+    let iio_exporter = collector.iio_exporter();
 
-    // Start the unified collection loop (consumes collector)
-    collector.start();
+    // Start the unified collection loop with cancellation support (consumes collector)
+    let collection_handle = collector.start(cancel_token);
+
+    let state = AppState {
+        rapl_exporter,
+        rdt_exporter,
+        core_exporter,
+        imc_exporter,
+        cha_exporter,
+        irp_exporter,
+        iio_exporter,
+        collection_handle: Some(collection_handle),
+    };
 
     Ok(state)
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(cancel_token: CancellationToken) {
+    tracing::info!("Installing signal handlers...");
+
     let ctrl_c = async {
+        tracing::debug!("Waiting for Ctrl+C...");
         signal::ctrl_c()
             .await
             .expect("Failed to install Ctrl+C handler");
+        tracing::info!("Ctrl+C received!");
     };
 
     #[cfg(unix)]
     let terminate = async {
+        tracing::debug!("Waiting for SIGTERM...");
         signal::unix::signal(signal::unix::SignalKind::terminate())
             .expect("Failed to install signal handler")
             .recv()
             .await;
+        tracing::info!("SIGTERM received!");
     };
 
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        _ = ctrl_c => {
+            tracing::warn!("Shutdown triggered by Ctrl+C");
+        },
+        _ = terminate => {
+            tracing::warn!("Shutdown triggered by SIGTERM");
+        },
     }
 
-    tracing::info!("Shutdown signal received");
+    tracing::warn!("Shutdown signal received, initiating graceful shutdown...");
+    cancel_token.cancel();
+    tracing::warn!("Cancellation token activated");
 }
 
 #[tokio::main]
@@ -222,7 +246,7 @@ async fn main() -> Result<()> {
     let log_level = if args.verbose {
         tracing::Level::DEBUG
     } else {
-        tracing::Level::WARN
+        tracing::Level::INFO
     };
 
     tracing_subscriber::fmt().with_max_level(log_level).init();
@@ -294,8 +318,13 @@ async fn main() -> Result<()> {
         tracing::info!("No metrics specified, using defaults: IIO, IMC, IRP");
     }
 
+    let cancel_token = CancellationToken::new();
+
     tracing::info!("Using orchestrator mode (unified collection loop)");
-    let state = init_orchestrator_mode(config, collector_config)?;
+    let mut state = init_orchestrator_mode(config, collector_config, cancel_token.clone())?;
+
+    let collection_handle = state.collection_handle.take();
+
     let app_state = Arc::new(state);
 
     let app = Router::new()
@@ -308,8 +337,16 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(cancel_token))
         .await?;
+
+    tracing::info!("Server shutdown complete, waiting for collection loop to finish...");
+
+    if let Some(handle) = collection_handle {
+        let _ = handle.await;
+    }
+
+    tracing::info!("All tasks completed, exiting");
 
     Ok(())
 }

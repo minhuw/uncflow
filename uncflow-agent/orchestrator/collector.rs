@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::ExportConfig;
 use crate::prom::{
@@ -125,21 +126,27 @@ impl MetricCollector {
         Ok(collector)
     }
 
-    /// Start the centralized collection loop
-    pub fn start(self) -> JoinHandle<()> {
+    /// Start the centralized collection loop with cancellation support
+    pub fn start(self, cancel_token: CancellationToken) -> JoinHandle<()> {
         tracing::warn!("Starting centralized metric collection orchestrator");
 
         tokio::spawn(async move {
-            self.collection_loop().await;
+            self.collection_loop(cancel_token).await;
         })
     }
 
     /// Main unified collection loop
-    async fn collection_loop(self) {
+    async fn collection_loop(self, cancel_token: CancellationToken) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    tracing::info!("Collection loop shutting down");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
 
             // Collect all metrics in parallel using macro
             let mut tasks = Vec::new();

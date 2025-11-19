@@ -1,0 +1,24 @@
+[package]
+name = "uncflow-raw"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hardware register definitions for Intel Uncore Performance Monitoring"
+keywords = ["intel", "uncore", "performance", "monitoring", "msr"]
+categories = ["hardware-support", "no-std"]
+
+[features]
+default = ["skylake"]
+skylake = []
+cascadelake = []
+icelake = []
+
+[dependencies]
+thiserror = { workspace = true }
+libc = "0.2"
+
+[lib]
+name = "uncflow_raw"
+path = "src/lib.rs"
